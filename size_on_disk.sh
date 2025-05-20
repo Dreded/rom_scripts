@@ -6,7 +6,7 @@ MEDIA_DIR="/mnt/user/Stuff/ES-DE/ES-DE/downloaded_media"
 
 format_bytes_align() {
   local bytes=$1
-  if (( bytes >= 1073741824 )); then
+  if (( bytes >= 1073741824  )); then
     awk -v b="$bytes" 'BEGIN { printf "%.2f G", b / (1024*1024*1024) }'
   elif (( bytes >= 1048576 )); then
     awk -v b="$bytes" 'BEGIN { printf "%.0f M", b / (1024*1024) }'
@@ -15,12 +15,13 @@ format_bytes_align() {
   fi
 }
 
-# Set up total counters (in bytes)
+# Totals
 rom_total=0
 media_total=0
 image_total=0
 video_total=0
 manual_total=0
+
 sort_field="none"
 basic_output=0
 declare -a system_filters=()
@@ -78,7 +79,7 @@ tempfile=$(mktemp)
 
 [[ $basic_output -eq 0 ]] && echo -ne "Processing...\r"
 
-# Build directory list
+# Build ROM directory list
 if [[ ${#system_filters[@]} -gt 0 ]]; then
   rom_dirs=()
   for sys in "${system_filters[@]}"; do
@@ -88,12 +89,9 @@ else
   rom_dirs=("$ROMS_DIR"/*/)
 fi
 
-# Loop through each ROM system directory
+# Process each system
 for d in "${rom_dirs[@]}"; do
-  if [[ ! -d "$d" ]]; then
-    echo -e "[31mWarning:[0m Directory not found: $d" >&2
-    continue
-  fi
+  [[ ! -d "$d" ]] && echo -e "\033[31mWarning:\033[0m Directory not found: $d" >&2 && continue
 
   dirname=$(basename "$d")
   media_dir="$MEDIA_DIR/$dirname"
@@ -112,16 +110,9 @@ for d in "${rom_dirs[@]}"; do
   videos_kb=${videos_kb:-0}
   media_kb_images=$(( media_kb_images >= 0 ? media_kb_images : 0 ))
 
-  if [[ $rom_kb -le 4 && ${#system_filters[@]} -eq 0 ]]; then
-    continue
-  fi
+  [[ $rom_kb -le 4 && ${#system_filters[@]} -eq 0 ]] && continue
 
-  if [[ $rom_kb -le 4 && ${#system_filters[@]} -gt 0 ]]; then
-    rom_bytes=0
-  else
-    rom_bytes=$((rom_kb * 1024))
-  fi
-
+  rom_bytes=$((rom_kb * 1024))
   media_bytes=$((media_kb_full * 1024))
   image_bytes=$((media_kb_images * 1024))
   video_bytes=$((videos_kb * 1024))
@@ -140,12 +131,15 @@ for d in "${rom_dirs[@]}"; do
   manual_human=$(format_bytes_align "$manual_bytes")
   total_human=$(format_bytes_align "$total_bytes")
 
-  printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$dirname" "$rom_human" "$image_human" "$video_human" "$manual_human" "$total_human" >> "$tempfile"
+  # Output: include raw value for sorting
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\n" \
+    "$dirname" "$rom_human" "$image_human" "$video_human" "$manual_human" "$total_human" \
+    "$rom_bytes" "$media_bytes" "$total_bytes" >> "$tempfile"
 done
 
 [[ $basic_output -eq 0 ]] && echo -ne "                                         \r"
 
-# Output
+# Output table
 if [[ $basic_output -eq 1 ]]; then
   awk -F'\t' '{ printf "%s:%s:%s:%s:%s:%s\n", $1, $2, $3, $4, $5, $6 }' "$tempfile"
 else
@@ -153,20 +147,32 @@ else
   printf "%-15s %-10s %-10s %-10s %-10s %-12s\n" "System" "Roms" "Images" "Videos" "Manuals" "Total Size"
   printf "%-15s %-10s %-10s %-10s %-10s %-12s\n" "--------------" "--------" "--------" "--------" "--------" "------------"
 
-  cat "$tempfile" | awk -F'\t' '{ printf "%-15s %8s   %8s   %8s   %8s   %12s\n", $1, $2, $3, $4, $5, $6 }'
+  # Sorting logic
+  case "$sort_field" in
+    rom|r)   sort_col=7 ;;
+    media|m) sort_col=8 ;;
+    total|t) sort_col=9 ;;
+    *)       sort_col=0 ;;
+  esac
 
+  if [[ $sort_col -gt 0 ]]; then
+    sort -t $'\t' -nr -k"$sort_col" "$tempfile"
+  else
+    cat "$tempfile"
+  fi | awk -F'\t' '{ printf "%-15s %8s   %8s   %8s   %8s   %12s\n", $1, $2, $3, $4, $5, $6 }'
+
+  # Summary
   if [[ ${#system_filters[@]} -ne 1 ]]; then
     echo
-    printf "%-20s %s\n" "Roms:"              "$(format_bytes_align "$rom_total")"
-    printf "%-20s %s\n" "Images:"            "$(format_bytes_align "$image_total")"
-    printf "%-20s %s\n" "Videos:"            "$(format_bytes_align "$video_total")"
-    printf "%-20s %s\n" "Manuals:"           "$(format_bytes_align "$manual_total")"
-    printf "%-20s %s\n" "All Media:"         "$(format_bytes_align "$media_total")"
-    printf "%-20s %s\n" "Roms + Images:"     "$(format_bytes_align "$((rom_total + image_total))")"
-    printf "%-20s %s\n" "Roms + All Media:"  "$(format_bytes_align "$((rom_total + media_total))")"
+    printf "%-30s %s\n" "Roms:"              "$(format_bytes_align "$rom_total")"
+    printf "%-30s %s\n" "Images:"            "$(format_bytes_align "$image_total")"
+    printf "%-30s %s\n" "Videos:"            "$(format_bytes_align "$video_total")"
+    printf "%-30s %s\n" "Manuals:"           "$(format_bytes_align "$manual_total")"
+    printf "%-30s %s\n" "All Media:"         "$(format_bytes_align "$media_total")"
+    printf "%-30s %s\n" "Roms + Images:"     "$(format_bytes_align "$((rom_total + image_total))")"
+    printf "%-30s %s\n" "Roms + All Media:"  "$(format_bytes_align "$((rom_total + media_total))")"
     echo
   fi
-
 fi
 
 # Clean up
