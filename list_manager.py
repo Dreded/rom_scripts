@@ -3,10 +3,10 @@ import os
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QListWidget,
-    QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox, QLineEdit
+    QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox, QLineEdit,
+    QMenuBar, QMenu, QStyle, QToolButton
 )
-from PyQt5.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, pyqtSignal  # updated with SignalProxy
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+from PyQt5.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, pyqtSignal
 
 
 class SignalProxy(QObject):
@@ -43,7 +43,7 @@ class ListManager(QWidget):
             except Exception:
                 original_list = []
 
-            if current_list != original_list:
+            if current_list != original_list or self.source_dir_edit.text().strip() != self.orig_source_dir:
                 reply = QMessageBox.question(
                     self,
                     "Unsaved Changes",
@@ -59,11 +59,11 @@ class ListManager(QWidget):
                     event.accept()
                     return
         event.accept()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(".list File Manager")
         self.resize(1280, 720)
-        self.setAcceptDrops(True)
 
         self.list_file = None
         self.source_dir = None
@@ -71,14 +71,33 @@ class ListManager(QWidget):
         self.all_available = []
         self.all_in_list = []
 
-        self.status = QLabel("No file loaded")
-        self.counts = QLabel("0 available, 0 in list")
+        menu_bar = QMenuBar(self)
+        file_menu = menu_bar.addMenu("File")
 
-        self.load_button = QPushButton("Load .list File")
-        self.load_button.clicked.connect(self.load_list_file)
+        load_action = file_menu.addAction("Load List File")
+        load_action.triggered.connect(self.load_list_file)
+
+        new_action = file_menu.addAction("New List File")
+        new_action.triggered.connect(self.create_new_list_file)
 
         self.save_button = QPushButton("Save Changes")
         self.save_button.clicked.connect(self.save_list_file)
+
+        self.source_dir_edit = QLineEdit()
+        self.source_dir_edit.setPlaceholderText("Source directory from first line of file")
+        self.source_dir_edit.textChanged.connect(self.update_source_dir)
+
+        self.change_source_button = QToolButton()
+        self.change_source_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        self.change_source_button.setToolTip("Change Source Directory")
+        self.change_source_button.clicked.connect(self.change_source_directory)
+
+        source_layout = QHBoxLayout()
+        source_layout.addWidget(self.source_dir_edit)
+        source_layout.addWidget(self.change_source_button)
+
+        self.status = QLabel("No file loaded")
+        self.counts = QLabel("0 available, 0 in list")
 
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Type 4+ characters to search...")
@@ -116,8 +135,10 @@ class ListManager(QWidget):
         lists_layout.addWidget(self.in_list)
 
         top_layout = QVBoxLayout()
-        top_layout.addWidget(self.load_button)
+        top_layout.setMenuBar(menu_bar)
         top_layout.addWidget(self.save_button)
+        top_layout.addWidget(QLabel("Source Directory:"))
+        top_layout.addLayout(source_layout)
         top_layout.addLayout(search_layout)
         top_layout.addWidget(self.status)
         top_layout.addWidget(self.counts)
@@ -126,11 +147,51 @@ class ListManager(QWidget):
         self.setLayout(top_layout)
         self.threadpool = QThreadPool()
 
+    def update_source_dir(self, text):
+        self.orig_source_dir = text.strip()
+        self.source_dir = os.path.normpath(self.orig_source_dir.replace("/mnt/user/Stuff/", "Y:/"))
+
+    def change_source_directory(self):
+        start_dir = ""
+        if os.path.isdir(self.source_dir):
+            start_dir = self.source_dir
+        folder = QFileDialog.getExistingDirectory(self, "Select New Source Folder", start_dir)
+        if folder:
+            linux_style_path = folder.replace("\\", "/").replace("Y:/", "/mnt/user/Stuff/")
+            self.source_dir_edit.setText(linux_style_path)
+
+    def create_new_list_file(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Source Folder")
+        if not folder:
+            return
+        save_path, _ = QFileDialog.getSaveFileName(self, "Create .list File", "", "List Files (*.list)")
+        if not save_path:
+            return
+        linux_style_path = folder.replace("\\", "/").replace("Y:/", "/mnt/user/Stuff/")
+        try:
+            with open(save_path, 'w', newline='\n') as f:
+                f.write(linux_style_path + '\n')
+            QMessageBox.information(self, "Created", f"New .list file created:\n{save_path}")
+            self.list_file = save_path
+            self.orig_source_dir = linux_style_path
+            self.source_dir = folder
+            self.source_dir_edit.setText(linux_style_path)
+            self.current_entries = set()
+            self.all_available = []
+            self.all_in_list = []
+            self.status.setText("Loading")
+            self.loading_dots = 0
+            self.loading_timer = QTimer(self)
+            self.loading_timer.timeout.connect(self.animate_loading)
+            self.loading_timer.start(300)
+            QTimer.singleShot(50, self.start_background_worker)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to create file:\n{e}")
+
     def load_list_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select .list File", "", "List Files (*.list)")
         if not path:
             return
-
         self.list_file = path
         try:
             with open(path, 'r') as f:
@@ -138,17 +199,15 @@ class ListManager(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to read list file:\n{e}")
             return
-
         if not lines:
             QMessageBox.critical(self, "Error", "List file is empty.")
             return
-
         self.orig_source_dir = lines[0].strip()
+        self.source_dir_edit.setText(self.orig_source_dir)
         self.source_dir = os.path.normpath(self.orig_source_dir.replace("/mnt/user/Stuff/", "Y:/"))
         if not os.path.isdir(self.source_dir):
             QMessageBox.critical(self, "Error", f"Source directory does not exist:\n{self.source_dir}")
             return
-
         self.loading_dots = 0
         self.loading_timer = QTimer(self)
         self.loading_timer.timeout.connect(self.animate_loading)
@@ -161,10 +220,9 @@ class ListManager(QWidget):
     def start_background_worker(self):
         self.signal_proxy = SignalProxy(self)
         self.signal_proxy.finished.connect(self.finish_list_update)
-
         worker = ListLoaderWorker(self.source_dir, self.current_entries, self.signal_proxy)
         self.threadpool.start(worker)
-        self.worker = worker  # keep a reference alive
+        self.worker = worker
 
     def finish_list_update(self, available):
         if hasattr(self, 'loading_timer') and self.loading_timer.isActive():
@@ -234,24 +292,6 @@ class ListManager(QWidget):
             self.all_available += removed
             self.all_available = sorted(self.all_available, key=str.lower)
             self.filter_lists()
-
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent):
-        if not self.list_file or not self.source_dir:
-            return
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            try:
-                rel = os.path.relpath(path, self.source_dir)
-                if rel.startswith(".."):
-                    raise ValueError
-                self.current_entries.add(rel.replace("\\", "/"))
-            except ValueError:
-                QMessageBox.warning(self, "Skipped", f"{path} is not in the source directory.")
-        self.filter_lists()
 
     def animate_loading(self):
         self.loading_dots = (self.loading_dots + 1) % 4
