@@ -66,7 +66,7 @@ def sync_windows_with_progress(src_path, dst_path):
             if line.endswith('%'):
                 print(f"\r{line}  \r", end='', flush=True)
             elif len(line) > 10:
-                sys.stdout.write("\r" + " " * 80 + "\r")
+                sys.stdout.write("\r" + " " * 120 + "\r")
                 relative = str(line)
                 src_str = str(src_path)
                 if src_str in line:
