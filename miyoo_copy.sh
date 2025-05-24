@@ -40,7 +40,6 @@ declare -A map=(
 
 # Files to exclude from deletion
 excludes=(
-  "miyoogamelist.xml.bak"
   "~Filter.miyoocmd"
   "~Refresh roms.miyoocmd"
 )
@@ -62,7 +61,16 @@ for sys in "${!map[@]}"; do
   fi
 
   echo "Syncing $src_path -> $dst_path"
-  rsync -av --size-only "${exclude_args[@]}" --delete "$src_path/" "$dst_path/"
+  rsync -a --info=progress2 --size-only "${exclude_args[@]}" --delete "$src_path/" "$dst_path/"
+done
+
+# Rename gamelist.xml to miyoogamelist.xml after sync
+echo "Renaming gamelist.xml to miyoogamelist.xml..."
+for dst_dir in "$DST"/*; do
+  if [[ -f "$dst_dir/gamelist.xml" ]]; then
+    echo "Renaming $dst_dir/gamelist.xml -> $dst_dir/miyoogamelist.xml"
+    mv -f "$dst_dir/gamelist.xml" "$dst_dir/miyoogamelist.xml"
+  fi
 done
 
 # Clean up miyoogamelist.xml files
