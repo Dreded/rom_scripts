@@ -17,7 +17,7 @@ DST = Path("G:/roms" if is_windows else "/mnt/g/roms")
 # System mapping
 system_map = {
     "atari2600": "ATARI", "atari5200": "FIFTYTWOHUNDRED", "atari7800": "SEVENTYEIGHTHUNDRED",
-    "cps1": "CPS1", "cps2": "CPS2", "cps3": "CPS3", "fbneo": "ARCADE", "gamegear": "GG",
+    "cps1": "CPS1", "cps2": "CPS2", "cps3": "CPS3", "fbneo": "FBNEO", "gamegear": "GG",
     "gb": "GB", "gba": "GBA", "gbc": "GBC", "genesis": "MD", "gw": "GW", "lynx": "LYNX", "mastersystem": "MS",
     "nds": "NDS", "neocd": "NEOCD", "neogeo": "NEOGEO", "nes": "FC", "ngp": "NGP", "pcecd": "PCECD",
     "pico": "PICO", "ports": "PORTS", "psx": "PS", "scummvm": "SCUMMVM", "sega32x": "THIRTYTWOX",
