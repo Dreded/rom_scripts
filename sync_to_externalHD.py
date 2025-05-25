@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 # ========= USER CONFIGURATION =========
-# 🔧 Only modify the section below that matches your OS
+# 🛠️ Only modify the section below that matches your OS
 
 # --- Windows Paths ---
 SRC_ESDE_WIN = Path("Y:/ES-DE/ES-DE")
@@ -40,12 +40,40 @@ EXCLUDE_RULES = {
 
 is_windows = platform.system() == "Windows"
 dry_run = "--run" not in sys.argv
+verbose_mode = "--verbose" in sys.argv
 
 # Set up source/destination pairs
 FOLDER_PAIRS = [
     (SRC_ESDE_WIN, DST_ESDE_WIN) if is_windows else (SRC_ESDE_LINUX, DST_ESDE_LINUX),
     (SRC_ROMS_WIN, DST_ROMS_WIN) if is_windows else (SRC_ROMS_LINUX, DST_ROMS_LINUX)
 ]
+
+# ========= REGEX FOR ROBUST LINE MATCHING =========
+# Matches:
+# 1. Robocopy operation lines like "New File 123456 File.png"
+# 2. Folder summary lines like "48    Y:\Path\To\Folder\"
+# 3. Progress lines like " 42.8%  "
+highlight_re = re.compile(
+    r'^\s*(?P<type>\*EXTRA Dir|\*EXTRA File|Newer|New File|Older|New Dir)\s+'
+    r'(?P<size>-?\d+(\.\d+)?\s*[kKmMgG]?)\s+(?P<filename>.+)$|'
+    r'^\s*(?P<count>\d+)\s+(?P<path>[A-Z]:\\.*\\)$'
+)
+progress_re = re.compile(r'^\s*(\d{1,3}(\.\d+)?%)\s*$')
+
+INDENT = " " * 8  # aligns output away from robocopy progress updates
+
+# ========= FORMATTER =========
+
+def format_highlight_line(match: re.Match, prefix: str) -> str:
+    if match.group('type'):
+        type_ = match.group('type')
+        size = match.group('size').strip()
+        filename = match.group('filename')
+        return f"{prefix}{type_:<12} {size:>8}  {filename}"
+    else:
+        count = match.group('count')
+        path = match.group('path')
+        return f"{prefix}Folder       {count:>6}  {path}"
 
 # ========= SYNC FUNCTIONS =========
 
@@ -74,10 +102,39 @@ def sync_with_robocopy(src: Path, dst: Path, exclude=None):
 
     print(f"▶ Running: {' '.join(cmd)}\n")
 
-    # Let robocopy print normally
-    process = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
-    process.wait()
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    last_length = 0
 
+    try:
+        for line in process.stdout:
+            if verbose_mode:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                continue
+
+            clean_line = line.replace('\t', '    ')  # Preserve \r for progress updates
+            match = highlight_re.match(clean_line)
+            progress = progress_re.match(clean_line)
+
+            if match:
+                output = format_highlight_line(match, INDENT)
+                print("\r" + " " * last_length, end="\r", flush=True)
+                print(output, end="\r", flush=True)
+                last_length = len(output)
+            elif progress:
+                print(f"\r{progress.group(1)}", end="", flush=True)
+            else:
+                if last_length:
+                    print("\r" + " " * last_length, end="\r", flush=True)
+                    last_length = 0
+                print(clean_line, end='', flush=True)
+
+    except KeyboardInterrupt:
+        process.terminate()
+        print("\n⛔ Sync interrupted by user.")
+        return
+
+    process.wait()
     if process.returncode <= 7:
         print(f"\n✅ {'Simulated' if dry_run else 'Synced'}: {src} → {dst}")
     else:
