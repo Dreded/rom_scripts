@@ -5,64 +5,76 @@ import subprocess
 import sys
 import re
 from pathlib import Path
+from argparse import ArgumentParser, Action
 
 # ========= USER CONFIGURATION =========
-# 🛠️ Only modify the section below that matches your OS
 
-# --- Windows Paths ---
+# Windows
 SRC_ESDE_WIN = Path("Y:/ES-DE/ES-DE")
 DST_ESDE_WIN = Path("D:/ES-DE")
-
 SRC_ROMS_WIN = Path("Y:/ES-DE/ROMs")
 DST_ROMS_WIN = Path("D:/ROMs")
 
-# --- Linux Paths ---
+# Linux
 SRC_ESDE_LINUX = Path("/mnt/Stuff/ES-DE/ES-DE")
 DST_ESDE_LINUX = Path("/mnt/d/ES-DE")
-
 SRC_ROMS_LINUX = Path("/mnt/Stuff/ES-DE/ROMs")
 DST_ROMS_LINUX = Path("/mnt/d/ROMs")
 
-# ========= EXCLUSION RULES =========
-# Exclude folders or files *relative to each system folder* in ROMs.
-EXCLUDE_RULES = {
-    "ROMs": {
-        "dirs": ["Imgs", "Manuals"],
-        "files": ["gamelist.xml"]
-    },
-    "ES-DE": {
-        "dirs": [],
-        "files": []
-    }
-}
-
-# ========= INTERNAL SETUP =========
+# ========= PLATFORM DETECTION =========
 
 is_windows = platform.system() == "Windows"
-dry_run = "--run" not in sys.argv
-verbose_mode = "--verbose" in sys.argv
+default_src_esde = SRC_ESDE_WIN if is_windows else SRC_ESDE_LINUX
+default_dst_esde = DST_ESDE_WIN if is_windows else DST_ESDE_LINUX
+default_src_roms = SRC_ROMS_WIN if is_windows else SRC_ROMS_LINUX
+default_dst_roms = DST_ROMS_WIN if is_windows else DST_ROMS_LINUX
 
-# Set up source/destination pairs
-FOLDER_PAIRS = [
-    (SRC_ESDE_WIN, DST_ESDE_WIN) if is_windows else (SRC_ESDE_LINUX, DST_ESDE_LINUX),
-    (SRC_ROMS_WIN, DST_ROMS_WIN) if is_windows else (SRC_ROMS_LINUX, DST_ROMS_LINUX)
-]
+# ========= ARGUMENT PARSING =========
 
-# ========= REGEX FOR ROBUST LINE MATCHING =========
-# Matches:
-# 1. Robocopy operation lines like "New File 123456 File.png"
-# 2. Folder summary lines like "48    Y:\Path\To\Folder\"
-# 3. Progress lines like " 42.8%  "
-highlight_re = re.compile(
-    r'^\s*(?P<type>\*EXTRA Dir|\*EXTRA File|Newer|New File|Older|New Dir)\s+'
-    r'(?P<size>-?\d+(\.\d+)?\s*[kKmMgG]?)\s+(?P<filename>.+)$|'
-    r'^\s*(?P<count>\d+)\s+(?P<path>[A-Z]:\\.*\\)$'
-)
+class CollectExclude(Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is None:
+            setattr(namespace, self.dest, [])
+        getattr(namespace, self.dest).append(values)
+
+parser = ArgumentParser(description="Sync subfolders only from ES-DE/ROMs using robocopy or rsync.")
+parser.add_argument("--dry-run", action="store_true", help="Simulate sync without writing files")
+parser.add_argument("--verbose", action="store_true", help="Show full robocopy/rsync output")
+parser.add_argument("--roms", action="store_true", help="Sync ROMs subfolders")
+parser.add_argument("--es-de", action="store_true", help="Sync ES-DE subfolders")
+parser.add_argument("--SRC", type=str, help=f"Source override (default: {'Y:/ES-DE/ROMs' if is_windows else '/mnt/Stuff/ES-DE/ROMs'})")
+parser.add_argument("--DST", type=str, help=f"Destination override (default: {'D:/ROMs' if is_windows else '/mnt/d/ROMs'})")
+parser.add_argument("--exclude", action=CollectExclude, help="Exclude path (e.g., Imgs, *.pdf, psx/BadGame.chd)")
+parser.add_argument("--systems", type=str, help="Comma-separated list of subfolders (systems) to sync (e.g., snes,psx,nes)")
+parser.add_argument("--create-folders", action="store_true", help="Create destination subfolders if they don't exist")
+args = parser.parse_args()
+
+dry_run = args.dry_run
+verbose_mode = args.verbose
+selected_systems = [s.strip().lower() for s in args.systems.split(',')] if args.systems else None
+
+if not args.roms and not args.es_de:
+    parser.print_help()
+    print("\n❌ You must specify at least one of: --roms or --es-de\n")
+    sys.exit(1)
+
+FOLDER_TARGETS = []
+if args.roms:
+    src = Path(args.SRC) if args.SRC else default_src_roms
+    dst = Path(args.DST) if args.DST else default_dst_roms
+    FOLDER_TARGETS.append(("ROMs", src, dst))
+if args.es_de:
+    src = Path(args.SRC) if args.SRC else default_src_esde
+    dst = Path(args.DST) if args.DST else default_dst_esde
+    FOLDER_TARGETS.append(("ES-DE", src, dst))
+
+# ========= HELPERS =========
+
+highlight_re = re.compile(r'^\s*(?P<type>\*EXTRA Dir|\*EXTRA File|Newer|New File|Older|New Dir)\s+' r'(?P<size>-?\d+(\.\d+)?\s*[kKmMgG]?)\s+(?P<filename>.+)$|^\s*(?P<count>\d+)\s+(?P<path>[A-Z]:\\.*\\)$')
 progress_re = re.compile(r'^\s*(\d{1,3}(\.\d+)?%)\s*$')
+INDENT = " " * 8
 
-INDENT = " " * 8  # aligns output away from robocopy progress updates
-
-# ========= FORMATTER =========
+summary = {"synced": [], "skipped_filtered": [], "skipped_missing_dst": [], "missing_src": []}
 
 def format_highlight_line(match: re.Match, prefix: str) -> str:
     if match.group('type'):
@@ -75,32 +87,75 @@ def format_highlight_line(match: re.Match, prefix: str) -> str:
         path = match.group('path')
         return f"{prefix}Folder       {count:>6}  {path}"
 
+def normalize_excludes(excludes):
+    normalized = []
+    for ex in excludes or []:
+        path = Path(ex)
+        parts = path.parts
+        if len(parts) > 1 and parts[0].lower() in ["roms", "es-de"]:
+            ex = Path(*parts[1:])
+        normalized.append(str(ex))
+    return normalized
+
 # ========= SYNC FUNCTIONS =========
 
-def sync_with_robocopy(src: Path, dst: Path, exclude=None):
-    cmd = [
-        "robocopy",
-        str(src),
-        str(dst),
-        "/MIR",
-        "/FFT",
-        # "/NJH", "/NJS", "/NP"  # Clean output: No Job Header / No Job Summary / No Progress
-    ]
-    if exclude:
-        for path in exclude.get("dirs", []):
-            for sub in src.iterdir():
-                if sub.is_dir():
-                    cmd.extend(["/XD", str(sub / path)])
-        for path in exclude.get("files", []):
-            for sub in src.iterdir():
-                if sub.is_dir():
-                    cmd.extend(["/XF", str(sub / path)])
+def sync_folder(src: Path, dst: Path, rel_excludes):
+    if not src.exists():
+        summary["missing_src"].append(src.name)
+        print(f"\n⚠️  Skipping: {src} does not exist.")
+        return
+
+    print(f"\n📁 Syncing subfolders of: {src} → {dst}")
+    print("🔍 Exclusions (relative to each system folder):")
+    for e in rel_excludes:
+        print(f"   - system/{e}")
+    if selected_systems:
+        print(f"📦 Filtering systems: {', '.join(selected_systems)}")
+
+    for sub in sorted(src.iterdir()):
+        if not sub.is_dir():
+            continue
+        if selected_systems and sub.name.lower() not in selected_systems:
+            summary["skipped_filtered"].append(sub.name)
+            continue
+
+        target_dst = dst / sub.name
+
+        if not target_dst.exists():
+            if args.create_folders:
+                target_dst.mkdir(parents=True, exist_ok=True)
+            else:
+                summary["skipped_missing_dst"].append(sub.name)
+                print(f"⚠️  Skipping '{sub.name}' (destination folder does not exist)")
+                continue
+
+        excludes = [e for e in rel_excludes if Path(e).parts[0].lower() in [sub.name.lower(), '*'] or Path(e).name == e]
+
+        if is_windows:
+            sync_with_robocopy(sub, target_dst, excludes)
+        else:
+            sync_with_rsync(sub, target_dst, excludes)
+
+        summary["synced"].append(sub.name)
+
+def sync_with_robocopy(src: Path, dst: Path, excludes):
+    cmd = ["robocopy", str(src), str(dst), "/MIR", "/FFT", "/NJH", "/NJS"]
+
+    for ex in excludes:
+        path = Path(ex)
+        if "*" in ex:
+            cmd.extend(["/XD", path.name])
+            cmd.extend(["/XF", path.name])
+        elif path.is_dir() or not path.suffix:
+            cmd.extend(["/XD", str(path.name)])
+        else:
+            cmd.extend(["/XF", str(path.name)])
 
     if dry_run:
         cmd.append("/L")
-        print(f"🔎 Dry run (Windows): {' '.join(cmd)}")
-
-    print(f"▶ Running: {' '.join(cmd)}\n")
+        print(f"🔎 [Dry run] robocopy: {src} → {dst}", end="\r")
+    elif verbose_mode:
+        cmd = [p for p in cmd if p not in ["/NJH", "/NJS", "/NP"]]
 
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     last_length = 0
@@ -108,75 +163,74 @@ def sync_with_robocopy(src: Path, dst: Path, exclude=None):
     try:
         for line in process.stdout:
             if verbose_mode:
-                sys.stdout.write(line)
-                sys.stdout.flush()
+                print(line, end="")
                 continue
 
-            clean_line = line.replace('\t', '    ')  # Preserve \r for progress updates
+            clean_line = line.replace('\t', '    ')
             match = highlight_re.match(clean_line)
             progress = progress_re.match(clean_line)
 
             if match:
                 output = format_highlight_line(match, INDENT)
-                print("\r" + " " * last_length, end="\r", flush=True)
-                print(output, end="\r", flush=True)
+                print("\r" + " " * last_length, end="\r")
+                print(output, end="\r")
                 last_length = len(output)
             elif progress:
                 print(f"\r{progress.group(1)}", end="", flush=True)
             else:
                 if last_length:
-                    print("\r" + " " * last_length, end="\r", flush=True)
+                    print("\r" + " " * last_length, end="\r")
                     last_length = 0
-                print(clean_line, end='', flush=True)
+                print(clean_line, end="")
 
     except KeyboardInterrupt:
         process.terminate()
-        print("\n⛔ Sync interrupted by user.")
+        print("\n⛔ Interrupted.")
         return
 
     process.wait()
-    if process.returncode <= 7:
-        print(f"\n✅ {'Simulated' if dry_run else 'Synced'}: {src} → {dst}")
-    else:
-        print(f"\n❌ Robocopy error (code {process.returncode}) for {src} → {dst}")
+    final_status = f"{INDENT}✅ {'Simulated' if dry_run else 'Synced'}: {src} → {dst}\n"
+    print("\r" + " " * last_length, end="\r", flush=True)
+    print(final_status)
 
-def sync_with_rsync(src: Path, dst: Path, exclude=None):
-    cmd = [
-        "rsync",
-        "-a",
-        "--delete",
-        "--modify-window=2",
-        f"{src}/",
-        f"{dst}/"
-    ]
-    if not dry_run:
-        cmd.insert(1, "--info=progress2")
-    if exclude:
-        for path in exclude.get("dirs", []):
-            cmd.insert(1, f"--exclude=*/{path}/")
-        for path in exclude.get("files", []):
-            cmd.insert(1, f"--exclude=*/{path}")
+def sync_with_rsync(src: Path, dst: Path, excludes):
+    cmd = ["rsync", "-a", "--delete", f"{src}/", f"{dst}/"]
     if dry_run:
         cmd.insert(1, "--dry-run")
-        print(f"🔎 Dry run (Linux): {' '.join(cmd)}")
-
-    result = subprocess.run(cmd)
-    if result.returncode == 0:
-        print(f"✅ {'Simulated' if dry_run else 'Synced'}: {src} → {dst}")
+        print(f"🔎 [Dry run] rsync: {src} → {dst}", end="\r")
     else:
-        print(f"❌ rsync error (code {result.returncode}) for {src} → {dst}")
+        cmd.insert(1, "--info=progress2")
+
+    for ex in excludes:
+        cmd.insert(1, f"--exclude={ex}")
+
+    subprocess.run(cmd)
 
 # ========= MAIN =========
 
+def print_summary():
+    print("\n🔄 Sync Summary")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    for name in summary["synced"]:
+        print(f"✅ Synced:     {name}")
+    for name in summary["skipped_filtered"]:
+        print(f"🚫 Skipped:    {name} (filtered)")
+    for name in summary["skipped_missing_dst"]:
+        print(f"⚠️  Skipped:    {name} (destination missing)")
+    for name in summary["missing_src"]:
+        print(f"❌ Skipped:    {name} (source missing)")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    total = sum(len(v) for v in summary.values())
+    print(f"{total} attempted / {len(summary['synced'])} synced / {len(summary['missing_src'])} missing / {len(summary['skipped_filtered']) + len(summary['skipped_missing_dst'])} skipped")
+
+
 def main():
     print("🔁 Starting sync " + ("(dry run)" if dry_run else "(real run)") + "...\n")
-    for src, dst in FOLDER_PAIRS:
-        folder_key = src.name
-        exclude = EXCLUDE_RULES.get(folder_key, {})
-        if is_windows:
-            sync_with_robocopy(src, dst, exclude)
-        else:
-            sync_with_rsync(src, dst, exclude)
+    normalized_excludes = normalize_excludes(args.exclude)
+    for label, src, dst in FOLDER_TARGETS:
+        sync_folder(src, dst, normalized_excludes)
+    print_summary()
+    print("\n⚠️  Only synced subfolders — files in root SRC are ignored.\n")
 
 if __name__ == "__main__":
     main()
