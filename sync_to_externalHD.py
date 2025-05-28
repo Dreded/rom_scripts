@@ -38,6 +38,7 @@ class CollectExclude(Action):
         getattr(namespace, self.dest).append(values)
 
 parser = ArgumentParser(description="Sync subfolders only from ES-DE/ROMs using robocopy or rsync.")
+parser.add_argument("--mirror", action="store_true", help="Enable mirroring (delete files at destination that no longer exist in source)")
 parser.add_argument("--dry-run", action="store_true", help="Simulate sync without writing files")
 parser.add_argument("--verbose", action="store_true", help="Show full robocopy/rsync output")
 parser.add_argument("--roms", action="store_true", help="Sync ROMs subfolders")
@@ -50,6 +51,9 @@ parser.add_argument("--create-folders", action="store_true", help="Create destin
 args = parser.parse_args()
 
 dry_run = args.dry_run
+# Force mirroring on during dry-run to collect complete *EXTRA info
+if dry_run:
+    args.mirror = True
 verbose_mode = args.verbose
 selected_systems = [s.strip().lower() for s in args.systems.split(',')] if args.systems else None
 
@@ -61,20 +65,26 @@ if not args.roms and not args.es_de:
 FOLDER_TARGETS = []
 if args.roms:
     src = Path(args.SRC) if args.SRC else default_src_roms
+    if not src.exists():
+        print(f"❌ Source path does not exist: {src}")
+        sys.exit(1)
     dst = Path(args.DST) if args.DST else default_dst_roms
     FOLDER_TARGETS.append(("ROMs", src, dst))
 if args.es_de:
     src = Path(args.SRC) if args.SRC else default_src_esde
+    if not src.exists():
+        print(f"❌ Source path does not exist: {src}")
+        sys.exit(1)
     dst = Path(args.DST) if args.DST else default_dst_esde
     FOLDER_TARGETS.append(("ES-DE", src, dst))
 
-# ========= HELPERS =========
+# ========= SYNC FUNCTIONS =========
 
 highlight_re = re.compile(r'^\s*(?P<type>\*EXTRA Dir|\*EXTRA File|Newer|New File|Older|New Dir)\s+' r'(?P<size>-?\d+(\.\d+)?\s*[kKmMgG]?)\s+(?P<filename>.+)$|^\s*(?P<count>\d+)\s+(?P<path>[A-Z]:\\.*\\)$')
 progress_re = re.compile(r'^\s*(\d{1,3}(\.\d+)?%)\s*$')
 INDENT = " " * 8
 
-summary = {"synced": [], "skipped_filtered": [], "skipped_missing_dst": [], "missing_src": []}
+summary = {"synced": [], "skipped_filtered": [], "skipped_missing_dst": [], "missing_src": [], "extras": {}}
 
 def format_highlight_line(match: re.Match, prefix: str) -> str:
     if match.group('type'):
@@ -97,13 +107,85 @@ def normalize_excludes(excludes):
         normalized.append(str(ex))
     return normalized
 
-# ========= SYNC FUNCTIONS =========
+def sync_with_robocopy(src: Path, dst: Path, excludes):
+    delete_flag = "/MIR" if args.mirror else "/E"
+    cmd = ["robocopy", str(src), str(dst), delete_flag, "/FFT", "/NJH", "/NJS"]
+
+    for ex in excludes:
+        path = Path(ex)
+        if "*" in ex:
+            cmd.extend(["/XD", path.name])
+            cmd.extend(["/XF", path.name])
+        elif path.is_dir() or not path.suffix:
+            cmd.extend(["/XD", str(path.name)])
+        else:
+            cmd.extend(["/XF", str(path.name)])
+
+    if dry_run:
+        cmd.append("/L")
+        print(f"🔎 [Dry run] robocopy: {src} → {dst}", end="\r")
+    elif verbose_mode:
+        cmd = [p for p in cmd if p not in ["/NJH", "/NJS", "/NP"]]
+
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    last_length = 0
+    extra_lines = []
+
+    try:
+        for line in process.stdout:
+            if verbose_mode:
+                print(line, end="")
+                continue
+
+            clean_line = line.replace('\t', '    ')
+            if "*EXTRA" in clean_line:
+                extra_lines.append(clean_line.rstrip())
+
+            match = highlight_re.match(clean_line)
+            progress = progress_re.match(clean_line)
+
+            if match:
+                output = format_highlight_line(match, INDENT)
+                print("\r" + " " * last_length, end="\r")
+                print(output, end="\r")
+                last_length = len(output)
+            elif progress:
+                print(f"\r{progress.group(1)}", end="", flush=True)
+            else:
+                if last_length:
+                    print("\r" + " " * last_length, end="\r")
+                    last_length = 0
+                print(clean_line, end="")
+
+    except KeyboardInterrupt:
+        process.terminate()
+        print("\n⛔ Interrupted.",end="")
+        return
+
+    process.wait()
+    summary["extras"][src.name] = extra_lines
+    final_status = f"✅ {'Simulated' if dry_run else 'Synced'}: {src} → {dst}"
+    print("\r" + " " * last_length, end="\r", flush=True)
+    print(final_status, end="")
+
+
+def sync_with_rsync(src: Path, dst: Path, excludes):
+    delete_flag = "--delete" if args.mirror else None
+    cmd = ["rsync", "-a", f"{src}/", f"{dst}/"]
+    if delete_flag:
+        cmd.insert(2, delete_flag)
+    if dry_run:
+        cmd.insert(1, "--dry-run")
+        print(f"🔎 [Dry run] rsync: {src} → {dst}", end="\r")
+    else:
+        cmd.insert(1, "--info=progress2")
+
+    for ex in excludes:
+        cmd.insert(1, f"--exclude={ex}")
+
+    subprocess.run(cmd)
 
 def sync_folder(src: Path, dst: Path, rel_excludes):
-    if not src.exists():
-        summary["missing_src"].append(src.name)
-        print(f"\n⚠️  Skipping: {src} does not exist.")
-        return
 
     print(f"\n📁 Syncing subfolders of: {src} → {dst}")
     print("🔍 Exclusions (relative to each system folder):")
@@ -126,7 +208,7 @@ def sync_folder(src: Path, dst: Path, rel_excludes):
                 target_dst.mkdir(parents=True, exist_ok=True)
             else:
                 summary["skipped_missing_dst"].append(sub.name)
-                print(f"⚠️  Skipping '{sub.name}' (destination folder does not exist)")
+                print(f"\n⚠️  Skipping '{sub.name}' (destination folder does not exist)",end="")
                 continue
 
         excludes = [e for e in rel_excludes if Path(e).parts[0].lower() in [sub.name.lower(), '*'] or Path(e).name == e]
@@ -138,91 +220,30 @@ def sync_folder(src: Path, dst: Path, rel_excludes):
 
         summary["synced"].append(sub.name)
 
-def sync_with_robocopy(src: Path, dst: Path, excludes):
-    cmd = ["robocopy", str(src), str(dst), "/MIR", "/FFT", "/NJH", "/NJS"]
-
-    for ex in excludes:
-        path = Path(ex)
-        if "*" in ex:
-            cmd.extend(["/XD", path.name])
-            cmd.extend(["/XF", path.name])
-        elif path.is_dir() or not path.suffix:
-            cmd.extend(["/XD", str(path.name)])
-        else:
-            cmd.extend(["/XF", str(path.name)])
-
-    if dry_run:
-        cmd.append("/L")
-        print(f"🔎 [Dry run] robocopy: {src} → {dst}", end="\r")
-    elif verbose_mode:
-        cmd = [p for p in cmd if p not in ["/NJH", "/NJS", "/NP"]]
-
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    last_length = 0
-
-    try:
-        for line in process.stdout:
-            if verbose_mode:
-                print(line, end="")
-                continue
-
-            clean_line = line.replace('\t', '    ')
-            match = highlight_re.match(clean_line)
-            progress = progress_re.match(clean_line)
-
-            if match:
-                output = format_highlight_line(match, INDENT)
-                print("\r" + " " * last_length, end="\r")
-                print(output, end="\r")
-                last_length = len(output)
-            elif progress:
-                print(f"\r{progress.group(1)}", end="", flush=True)
-            else:
-                if last_length:
-                    print("\r" + " " * last_length, end="\r")
-                    last_length = 0
-                print(clean_line, end="")
-
-    except KeyboardInterrupt:
-        process.terminate()
-        print("\n⛔ Interrupted.")
-        return
-
-    process.wait()
-    final_status = f"{INDENT}✅ {'Simulated' if dry_run else 'Synced'}: {src} → {dst}\n"
-    print("\r" + " " * last_length, end="\r", flush=True)
-    print(final_status)
-
-def sync_with_rsync(src: Path, dst: Path, excludes):
-    cmd = ["rsync", "-a", "--delete", f"{src}/", f"{dst}/"]
-    if dry_run:
-        cmd.insert(1, "--dry-run")
-        print(f"🔎 [Dry run] rsync: {src} → {dst}", end="\r")
-    else:
-        cmd.insert(1, "--info=progress2")
-
-    for ex in excludes:
-        cmd.insert(1, f"--exclude={ex}")
-
-    subprocess.run(cmd)
-
-# ========= MAIN =========
-
 def print_summary():
-    print("\n🔄 Sync Summary")
+    print("\n\n🔄 Sync Summary")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    for name in summary["synced"]:
-        print(f"✅ Synced:     {name}")
-    for name in summary["skipped_filtered"]:
-        print(f"🚫 Skipped:    {name} (filtered)")
-    for name in summary["skipped_missing_dst"]:
-        print(f"⚠️  Skipped:    {name} (destination missing)")
-    for name in summary["missing_src"]:
-        print(f"❌ Skipped:    {name} (source missing)")
+
+    if summary["synced"]:
+        print(f"✅ Synced: {', '.join(sorted(summary['synced']))}")
+    if summary["skipped_filtered"]:
+        print(f"🚫 Filtered: {', '.join(sorted(summary['skipped_filtered']))}")
+    if summary["skipped_missing_dst"]:
+        print(f"⚠️  Missing DST: {', '.join(sorted(summary['skipped_missing_dst']))}")
+    
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    total = sum(len(v) for v in summary.values())
+    total = sum(len(v) for k, v in summary.items() if k != "extras")
     print(f"{total} attempted / {len(summary['synced'])} synced / {len(summary['missing_src'])} missing / {len(summary['skipped_filtered']) + len(summary['skipped_missing_dst'])} skipped")
 
+    if dry_run:
+        print("\n📋 Files/Folders in destination but not in source (from robocopy *EXTRA output):")
+        print("   ⚠️  These will NOT be deleted unless you use the --mirror flag.")
+
+        for system, lines in summary["extras"].items():
+            if lines:
+                print(f"\n📂 {system}:")
+                for line in lines:
+                    print(f"   {line}")
 
 def main():
     print("🔁 Starting sync " + ("(dry run)" if dry_run else "(real run)") + "...\n")
@@ -230,7 +251,8 @@ def main():
     for label, src, dst in FOLDER_TARGETS:
         sync_folder(src, dst, normalized_excludes)
     print_summary()
-    print("\n⚠️  Only synced subfolders — files in root SRC are ignored.\n")
+    print("\n⚠️  Only synced subfolders — files in root SRC are ignored.")
+    print("⚠️  These will NOT be deleted unless you use the --mirror flag.\n")
 
 if __name__ == "__main__":
     main()
